@@ -1,16 +1,22 @@
+import os
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
+from face_utils import get_face_embedding, compare_faces, get_face_embedding_for_verify
 from threat_detection import run_threat_analysis
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
 from collections import defaultdict
-from face_utils import get_face_embedding, compare_faces
 import time
 import secrets
 import string
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
 
@@ -256,33 +262,72 @@ def enroll_face(data: FaceEnrollModel):
     return {"message": "Face aur face password set ho gaya!"}
 
 
+# ADD THIS TO backend/main.py — Replace /face-login/verify-face route
+# Uses get_face_embedding_for_verify (separate temp file) for strict matching
+
 @app.post("/face-login/verify-face")
 def face_login_step1(data: FaceLoginStep1, request: Request):
     ip = get_ip(request)
     check_rate_limit(ip)
+
     user = users_col.find_one({"username": data.username})
     if not user:
         record_fail(ip)
         raise HTTPException(404, "User nahi mila")
     if not user.get("face_enrolled"):
-        raise HTTPException(400, "Face enroll nahi hai")
+        raise HTTPException(400, "Face enroll nahi hai. Pehle chat app se enroll karo.")
+
+    stored_embedding = user.get("face_embedding")
+    if not stored_embedding:
+        raise HTTPException(400, "Stored face embedding missing! Re-enroll karo.")
+
+    # ── AI Threat Detection first ─────────────────────────
     try:
-        new_emb = get_face_embedding(data.image)
+        threat = run_threat_analysis(data.image)
+        if not threat.get("safe",True):
+            log_audit("face_threat_blocked", data.username, ip, {
+                "threats": threat.get("threats",[]), "risk": threat.get("risk_level","unknown")
+            })
+            raise HTTPException(403, {
+                "message": f"Security threat detected! ({threat('risk_level')} risk)",
+                "threats": threat("threats",[]),
+                "risk_score": threat("risk_score",0),
+            })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Threat detection error: {e}")  # Don't block if threat detection fails
+
+    # ── Extract NEW embedding (separate temp file) ────────
+    try:
+        new_embedding = get_face_embedding_for_verify(data.image)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    result = compare_faces(user["face_embedding"], new_emb)
-    log_audit("face_verify", data.username, ip, {"match": result["match"]})
+
+    # ── STRICT comparison ─────────────────────────────────
+    result = compare_faces(stored_embedding, new_embedding)
+
+    log_audit("face_verify_attempt", data.username, ip, {
+        "match": result["match"],
+        "similarity": result["similarity"],
+        "confidence": result["confidence"],
+        "cosine_dist": result["distance"],
+    })
+
     if not result["match"]:
         record_fail(ip)
-        raise HTTPException(401, f"Face match nahi hua. Similarity: {round(result['similarity'], 2)}%")
+        detail = result.get("reason") or f"Face match nahi hua. Similarity: {result['similarity']}%"
+        raise HTTPException(401, detail)
+
+    # ── Issue temp token ──────────────────────────────────
     face_temp = create_face_temp_token(data.username)
     return {
-        "face_verified": True,
+        "face_verified":  True,
         "face_temp_token": face_temp,
-        "similarity": round(result["similarity"], 2),
-        "message": "Face verify ho gaya! Ab face password dalo."
+        "similarity":     result["similarity"],
+        "confidence":     result["confidence"],
+        "message":        f"Face verify! Similarity: {result['similarity']}% ({result['confidence']})",
     }
-
 
 @app.post("/face-login/verify-password")
 def face_login_step2(data: FaceLoginStep2, request: Request):
@@ -478,54 +523,3 @@ async def websocket_handler(websocket: WebSocket, token: str):
         users_col.update_one({"username": username}, {"$set": {"online": False}})
         print(f"❌ {username} disconnected")
 
-@app.post("/verify-face")
-def verify_face(data: dict):
-    username = data.get("username")
-    image_base64 = data.get("image")
-
-    if not username or not image_base64:
-        raise HTTPException(status_code=400, detail="Username aur image dono chahiye")
-
-    # ── AI Threat Check pehle ──
-    threat = run_threat_analysis(image_base64)
-    if not threat["safe"]:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "message": "Security threat detected! Login block ho gaya.",
-                "risk_level": threat["risk_level"],
-                "risk_score": threat["risk_score"],
-                "threats": threat["threats"]
-            }
-        )
-
-    user = users_col.find_one({"username": username})
-    if not user:
-        raise HTTPException(status_code=404, detail="User nahi mila")
-
-    if not user.get("face_enrolled"):
-        raise HTTPException(status_code=400, detail="Face enroll nahi hai")
-
-    try:
-        from face_utils import get_face_embedding, compare_faces
-        new_embedding = get_face_embedding(image_base64)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    result = compare_faces(user["face_embedding"], new_embedding)
-
-    if result["match"]:
-        return {
-            "verified": True,
-            "similarity": round(result["similarity"], 2),
-            "message": "Face verify ho gaya!",
-            "security": {
-                "risk_level": threat["risk_level"],
-                "risk_score": threat["risk_score"]
-            }
-        }
-    else:
-        raise HTTPException(
-            status_code=401,
-            detail=f"Face match nahi hua. Similarity: {round(result['similarity'], 2)}%"
-        )
