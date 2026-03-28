@@ -1,5 +1,4 @@
 import os
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
@@ -87,10 +86,12 @@ class QRScanModel(BaseModel):
 def now_utc():
     return datetime.now(timezone.utc)
 
-def hash_password(pw: str) -> str:
+def hash_password(pw):
+    pw = pw[:72]   # 🔥 important
     return pwd_context.hash(pw)
 
-def verify_password(pw: str, hashed: str) -> bool:
+def verify_password(pw, hashed):
+    pw = pw[:72]   # 🔥 truncate password
     return pwd_context.verify(pw, hashed)
 
 def create_access_token(username: str) -> str:
@@ -265,70 +266,93 @@ def enroll_face(data: FaceEnrollModel):
 # ADD THIS TO backend/main.py — Replace /face-login/verify-face route
 # Uses get_face_embedding_for_verify (separate temp file) for strict matching
 
+# ══════════════════════════════════════════════════════════
+# REPLACE THIS ENTIRE ROUTE in backend/main.py
+# Route: /face-login/verify-face
+# All bugs fixed (dict calling, threat detection, logging)
+# ══════════════════════════════════════════════════════════
+
 @app.post("/face-login/verify-face")
 def face_login_step1(data: FaceLoginStep1, request: Request):
     ip = get_ip(request)
     check_rate_limit(ip)
 
+    # ── 1. Fetch user ─────────────────────────────────────
     user = users_col.find_one({"username": data.username})
     if not user:
         record_fail(ip)
         raise HTTPException(404, "User nahi mila")
+
     if not user.get("face_enrolled"):
         raise HTTPException(400, "Face enroll nahi hai. Pehle chat app se enroll karo.")
 
     stored_embedding = user.get("face_embedding")
-    if not stored_embedding:
-        raise HTTPException(400, "Stored face embedding missing! Re-enroll karo.")
+    if not stored_embedding or len(stored_embedding) == 0:
+        raise HTTPException(400, "Stored face data missing — re-enroll karo.")
 
-    # ── AI Threat Detection first ─────────────────────────
+    # ── 2. AI Threat Detection ────────────────────────────
+    # ✅ FIXED: threat.get("key", default) — NOT threat("key")
     try:
         threat = run_threat_analysis(data.image)
-        if not threat.get("safe",True):
+        logger.info(
+            f"Threat check [{data.username}]: safe={threat.get('safe')} "
+            f"risk={threat.get('risk_level')} score={threat.get('risk_score')}"
+        )
+        if not threat.get("safe", True):
             log_audit("face_threat_blocked", data.username, ip, {
-                "threats": threat.get("threats",[]), "risk": threat.get("risk_level","unknown")
+                "threats":    threat.get("threats", []),
+                "risk_level": threat.get("risk_level", "unknown"),
+                "risk_score": threat.get("risk_score", 0),
             })
-            raise HTTPException(403, {
-                "message": f"Security threat detected! ({threat('risk_level')} risk)",
-                "threats": threat("threats",[]),
-                "risk_score": threat("risk_score",0),
-            })
+            raise HTTPException(403,
+                f"Security threat detected ({threat.get('risk_level','HIGH')} risk): "
+                + ", ".join(threat.get("threats", ["Unknown threat"]))
+            )
     except HTTPException:
-        raise
+        raise  # re-raise 403
     except Exception as e:
-        logger.warning(f"Threat detection error: {e}")  # Don't block if threat detection fails
+        # Non-blocking: log but don't stop login if threat detection crashes
+        logger.warning(f"Threat detection error (non-blocking): {e}")
 
-    # ── Extract NEW embedding (separate temp file) ────────
+    # ── 3. Extract new face embedding ─────────────────────
     try:
         new_embedding = get_face_embedding_for_verify(data.image)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    # ── STRICT comparison ─────────────────────────────────
+    # ── 4. STRICT face comparison ─────────────────────────
+    # compare_faces: cosine < 0.30 AND euclidean < 0.77 (BOTH must pass)
     result = compare_faces(stored_embedding, new_embedding)
 
+    logger.info(
+        f"Face compare [{data.username}]: "
+        f"match={result['match']} sim={result['similarity']}% "
+        f"cos={result['distance']} eucl={result['euclidean']} conf={result['confidence']}"
+    )
+
     log_audit("face_verify_attempt", data.username, ip, {
-        "match": result["match"],
+        "match":      result["match"],
         "similarity": result["similarity"],
         "confidence": result["confidence"],
-        "cosine_dist": result["distance"],
+        "distance":   result["distance"],
+        "euclidean":  result["euclidean"],
     })
 
+    # ── 5. Reject if no match ─────────────────────────────
     if not result["match"]:
         record_fail(ip)
-        detail = result.get("reason") or f"Face match nahi hua. Similarity: {result['similarity']}%"
-        raise HTTPException(401, detail)
+        raise HTTPException(401, result.get("reason") or
+            f"Face match nahi hua. Similarity {result['similarity']}% — minimum 70% chahiye.")
 
-    # ── Issue temp token ──────────────────────────────────
+    # ── 6. Issue short-lived face temp token ──────────────
     face_temp = create_face_temp_token(data.username)
     return {
-        "face_verified":  True,
+        "face_verified":   True,
         "face_temp_token": face_temp,
-        "similarity":     result["similarity"],
-        "confidence":     result["confidence"],
-        "message":        f"Face verify! Similarity: {result['similarity']}% ({result['confidence']})",
+        "similarity":      result["similarity"],
+        "confidence":      result["confidence"],
+        "message":         f"Face verified! {result['similarity']}% match ({result['confidence']})",
     }
-
 @app.post("/face-login/verify-password")
 def face_login_step2(data: FaceLoginStep2, request: Request):
     ip = get_ip(request)
