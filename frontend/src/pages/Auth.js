@@ -292,6 +292,33 @@ const s = {
     textTransform: "uppercase",
     letterSpacing: "1px",
   },
+  secFeatures: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: "8px",
+    marginTop: "18px",
+  },
+  secFeatureItem: (color) => ({
+    background: `${color}11`,
+    border: `1px solid ${color}33`,
+    borderRadius: "10px",
+    padding: "10px 12px",
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    animation: "slideInLeft 0.5s ease forwards",
+    opacity: 0,
+  }),
+  secFeatureIcon: {
+    fontSize: "18px",
+    flexShrink: 0,
+  },
+  secFeatureText: {
+    fontSize: "11px",
+    fontWeight: "600",
+    color: "rgba(255,255,255,0.75)",
+    lineHeight: "1.3",
+  },
 };
 
 export default function Auth({ onLogin }) {
@@ -458,6 +485,21 @@ export default function Auth({ onLogin }) {
                 Account hai?<span style={s.toggleSpan}>Login karo</span>
               </>
             )}
+          </div>
+
+          {/* Security Features Grid */}
+          <div style={s.secFeatures}>
+            {[
+              { icon: "🔒", label: "E2E Encrypted", color: "#22c55e", delay: "0.6s" },
+              { icon: "🪪", label: "Face Login", color: "#8b5cf6", delay: "0.65s" },
+              { icon: "🛡️", label: "AI Protection", color: "#f59e0b", delay: "0.7s" },
+              { icon: "📲", label: "QR Login", color: "#06b6d4", delay: "0.75s" },
+            ].map((item, i) => (
+              <div key={i} style={{...s.secFeatureItem(item.color), animationDelay: item.delay}}>
+                <span style={s.secFeatureIcon}>{item.icon}</span>
+                <span style={s.secFeatureText}>{item.label}</span>
+              </div>
+            ))}
           </div>
         </div>
       </div>
