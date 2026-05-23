@@ -1,4 +1,4 @@
-﻿# 🔐 SecureChat
+# 🔐 SecureChat
 ### Secure Face-Authenticated Messaging System
 
 **SecureChat** is a hybrid messaging solution with both a chat client and a biometric web login portal.
